@@ -1,0 +1,750 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000000000000000000000000000000000000..caf69fa4bb9ca79ae5ba5c665cad8d8f4e2dd4d0
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,4 @@
++__pycache__/
++*.pyc
++.venv/
++backend/lms.db
+diff --git a/README.md b/README.md
+index 97955c8c6256eec223dec4763f57c26b75493407..696f0fb6f2b8adfb499d4820c7110c4d8a3b1134 100644
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,68 @@
+-# Test-
+-We shall see
++# Aluminum Extrusion LMS (Phase 1)
++
++This repository contains Phase 1 of a Learning Management System (LMS) tailored for an aluminum extrusion manufacturing company in Michigan. The system focuses on ISO 9001:2015 and MIOSHA compliance readiness while keeping training fast and simple for shop-floor users.
++
++## Project Structure
++
++```
++backend/
++  app/
++    __init__.py
++    audit.py
++    auth.py
++    db.py
++    main.py
++    models.py
++    schemas.py
++    routers/
++      __init__.py
++      auth.py
++      users.py
++  requirements.txt
++  seed.py
++frontend/
++  README.md
++ docs/
++  assumptions.md
++  compliance.md
++  schema.md
++```
++
++## Phase 1 Setup
++
++1. Create a virtual environment and install dependencies:
++
++```bash
++cd backend
++python -m venv .venv
++source .venv/bin/activate
++pip install -r requirements.txt
++```
++
++2. Seed the database with roles, departments, admin user, and sample courses:
++
++```bash
++python seed.py
++```
++
++3. Start the API:
++
++```bash
++uvicorn app.main:app --reload
++```
++
++The API will be available at `http://127.0.0.1:8000`. The default admin user is:
++
++- Email: `admin@alumex.local`
++- Password: `ChangeMe123!`
++
++## Phase 1 Deliverables
++
++- Authentication system using JWT (`/auth/token`)
++- User, role, and department models
++- Audit logging foundation
++- Database schema for core entities
++- Seed data with aluminum extrusion training courses
++- Documentation for ISO 9001 and MIOSHA alignment
++
++Phase 2 tasks are listed in `docs/assumptions.md`.
+diff --git a/backend/app/__init__.py b/backend/app/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/backend/app/audit.py b/backend/app/audit.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..59fdc4157ebd9cde2d5addb3557848ef2cbd14b9
+--- /dev/null
++++ b/backend/app/audit.py
+@@ -0,0 +1,24 @@
++from sqlalchemy.orm import Session
++
++from . import models
++
++
++def log_audit(
++    db: Session,
++    action: str,
++    entity: str,
++    entity_id: str | None,
++    actor_id: int | None,
++    details: str | None = None,
++) -> models.AuditLog:
++    entry = models.AuditLog(
++        action=action,
++        entity=entity,
++        entity_id=entity_id,
++        actor_id=actor_id,
++        details=details,
++    )
++    db.add(entry)
++    db.commit()
++    db.refresh(entry)
++    return entry
+diff --git a/backend/app/auth.py b/backend/app/auth.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ccc19f1a1f76cd8e2712a9007e2a66a5daca2ce6
+--- /dev/null
++++ b/backend/app/auth.py
+@@ -0,0 +1,83 @@
++from datetime import datetime, timedelta
++from typing import Optional
++
++from fastapi import Depends, HTTPException, status
++from fastapi.security import OAuth2PasswordBearer
++from jose import JWTError, jwt
++from passlib.context import CryptContext
++from sqlalchemy.orm import Session
++
++from . import models
++from .db import SessionLocal
++
++SECRET_KEY = "change-me-in-prod"
++ALGORITHM = "HS256"
++ACCESS_TOKEN_EXPIRE_MINUTES = 60
++
++pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
++oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
++
++
++def get_db():
++    db = SessionLocal()
++    try:
++        yield db
++    finally:
++        db.close()
++
++
++def verify_password(plain_password: str, hashed_password: str) -> bool:
++    return pwd_context.verify(plain_password, hashed_password)
++
++
++def get_password_hash(password: str) -> str:
++    return pwd_context.hash(password)
++
++
++def authenticate_user(db: Session, email: str, password: str) -> Optional[models.User]:
++    user = db.query(models.User).filter(models.User.email == email).first()
++    if not user or not verify_password(password, user.hashed_password):
++        return None
++    return user
++
++
++def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
++    to_encode = data.copy()
++    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
++    to_encode.update({"exp": expire})
++    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
++
++
++def get_current_user(
++    token: str = Depends(oauth2_scheme),
++    db: Session = Depends(get_db),
++) -> models.User:
++    credentials_exception = HTTPException(
++        status_code=status.HTTP_401_UNAUTHORIZED,
++        detail="Could not validate credentials",
++        headers={"WWW-Authenticate": "Bearer"},
++    )
++    try:
++        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
++        email: str | None = payload.get("sub")
++        if email is None:
++            raise credentials_exception
++    except JWTError as exc:
++        raise credentials_exception from exc
++    user = db.query(models.User).filter(models.User.email == email).first()
++    if user is None:
++        raise credentials_exception
++    return user
++
++
++def require_role(role_name: str):
++    def role_checker(user: models.User = Depends(get_current_user)) -> models.User:
++        role_names = {assignment.role.name for assignment in user.roles}
++        if role_name not in role_names:
++            raise HTTPException(
++                status_code=status.HTTP_403_FORBIDDEN,
++                detail="Insufficient permissions",
++            )
++        return user
++
++    return role_checker
+diff --git a/backend/app/db.py b/backend/app/db.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ae8e16d1efffb4a3729c89c9b79effcc15690bf
+--- /dev/null
++++ b/backend/app/db.py
+@@ -0,0 +1,12 @@
++from sqlalchemy import create_engine
++from sqlalchemy.orm import declarative_base, sessionmaker
++
++DATABASE_URL = "sqlite:///./lms.db"
++
++engine = create_engine(
++    DATABASE_URL,
++    connect_args={"check_same_thread": False},
++)
++SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
++
++Base = declarative_base()
+diff --git a/backend/app/main.py b/backend/app/main.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1f20caf17aac2cf1005f882f7cc00457a417a53
+--- /dev/null
++++ b/backend/app/main.py
+@@ -0,0 +1,21 @@
++from fastapi import FastAPI
++
++from .db import Base, engine
++from .routers import auth as auth_router
++from .routers import users as users_router
++
++app = FastAPI(title="Aluminum Extrusion LMS")
++
++
++@app.on_event("startup")
++def on_startup() -> None:
++    Base.metadata.create_all(bind=engine)
++
++
++@app.get("/")
++def read_root():
++    return {"status": "ok", "service": "lms"}
++
++
++app.include_router(auth_router.router)
++app.include_router(users_router.router)
+diff --git a/backend/app/models.py b/backend/app/models.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ddd37251a8e0a08ad1adf31e981bb687bc596140
+--- /dev/null
++++ b/backend/app/models.py
+@@ -0,0 +1,151 @@
++from datetime import datetime
++from sqlalchemy import (
++    Boolean,
++    Column,
++    DateTime,
++    ForeignKey,
++    Integer,
++    String,
++    Text,
++    UniqueConstraint,
++)
++from sqlalchemy.orm import relationship
++
++from .db import Base
++
++
++class Department(Base):
++    __tablename__ = "departments"
++
++    id = Column(Integer, primary_key=True, index=True)
++    name = Column(String(120), unique=True, nullable=False)
++    location = Column(String(120), nullable=True)
++
++    users = relationship("User", back_populates="department")
++
++
++class Role(Base):
++    __tablename__ = "roles"
++
++    id = Column(Integer, primary_key=True, index=True)
++    name = Column(String(120), unique=True, nullable=False)
++    description = Column(Text, nullable=True)
++
++    users = relationship("UserRole", back_populates="role")
++
++
++class User(Base):
++    __tablename__ = "users"
++
++    id = Column(Integer, primary_key=True, index=True)
++    employee_id = Column(String(40), unique=True, nullable=False)
++    full_name = Column(String(160), nullable=False)
++    email = Column(String(160), unique=True, nullable=False, index=True)
++    hashed_password = Column(String(255), nullable=False)
++    is_active = Column(Boolean, default=True)
++    department_id = Column(Integer, ForeignKey("departments.id"), nullable=False)
++    created_at = Column(DateTime, default=datetime.utcnow)
++
++    department = relationship("Department", back_populates="users")
++    roles = relationship("UserRole", back_populates="user")
++
++
++class UserRole(Base):
++    __tablename__ = "user_roles"
++    __table_args__ = (UniqueConstraint("user_id", "role_id", name="uq_user_role"),)
++
++    id = Column(Integer, primary_key=True, index=True)
++    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
++    role_id = Column(Integer, ForeignKey("roles.id"), nullable=False)
++    assigned_at = Column(DateTime, default=datetime.utcnow)
++
++    user = relationship("User", back_populates="roles")
++    role = relationship("Role", back_populates="users")
++
++
++class Course(Base):
++    __tablename__ = "courses"
++
++    id = Column(Integer, primary_key=True, index=True)
++    title = Column(String(200), nullable=False)
++    category = Column(String(80), nullable=False)
++    description = Column(Text, nullable=True)
++    is_active = Column(Boolean, default=True)
++    created_at = Column(DateTime, default=datetime.utcnow)
++
++    modules = relationship("CourseModule", back_populates="course")
++
++
++class CourseModule(Base):
++    __tablename__ = "course_modules"
++
++    id = Column(Integer, primary_key=True, index=True)
++    course_id = Column(Integer, ForeignKey("courses.id"), nullable=False)
++    title = Column(String(200), nullable=False)
++    content_type = Column(String(40), nullable=False)
++    content_url = Column(String(500), nullable=True)
++    version = Column(String(40), nullable=False, default="1.0")
++    requires_ack = Column(Boolean, default=False)
++    updated_at = Column(DateTime, default=datetime.utcnow)
++
++    course = relationship("Course", back_populates="modules")
++    acknowledgments = relationship("Acknowledgment", back_populates="module")
++
++
++class Enrollment(Base):
++    __tablename__ = "enrollments"
++
++    id = Column(Integer, primary_key=True, index=True)
++    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
++    course_id = Column(Integer, ForeignKey("courses.id"), nullable=False)
++    assigned_reason = Column(String(120), nullable=False)
++    assigned_at = Column(DateTime, default=datetime.utcnow)
++    due_date = Column(DateTime, nullable=True)
++    completed_at = Column(DateTime, nullable=True)
++    status = Column(String(40), nullable=False, default="assigned")
++
++
++class Certification(Base):
++    __tablename__ = "certifications"
++
++    id = Column(Integer, primary_key=True, index=True)
++    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
++    course_id = Column(Integer, ForeignKey("courses.id"), nullable=False)
++    awarded_at = Column(DateTime, default=datetime.utcnow)
++    expires_at = Column(DateTime, nullable=True)
++    status = Column(String(40), nullable=False, default="active")
++
++
++class Incident(Base):
++    __tablename__ = "incidents"
++
++    id = Column(Integer, primary_key=True, index=True)
++    reported_by = Column(Integer, ForeignKey("users.id"), nullable=False)
++    incident_type = Column(String(120), nullable=False)
++    description = Column(Text, nullable=False)
++    occurred_at = Column(DateTime, default=datetime.utcnow)
++    retraining_required = Column(Boolean, default=False)
++
++
++class Acknowledgment(Base):
++    __tablename__ = "acknowledgments"
++
++    id = Column(Integer, primary_key=True, index=True)
++    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
++    module_id = Column(Integer, ForeignKey("course_modules.id"), nullable=False)
++    revision = Column(String(40), nullable=False)
++    acknowledged_at = Column(DateTime, default=datetime.utcnow)
++
++    module = relationship("CourseModule", back_populates="acknowledgments")
++
++
++class AuditLog(Base):
++    __tablename__ = "audit_logs"
++
++    id = Column(Integer, primary_key=True, index=True)
++    actor_id = Column(Integer, ForeignKey("users.id"), nullable=True)
++    action = Column(String(120), nullable=False)
++    entity = Column(String(120), nullable=False)
++    entity_id = Column(String(120), nullable=True)
++    details = Column(Text, nullable=True)
++    created_at = Column(DateTime, default=datetime.utcnow)
+diff --git a/backend/app/routers/__init__.py b/backend/app/routers/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/backend/app/routers/auth.py b/backend/app/routers/auth.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5e1f154ec1a215c58dcb57a9b0059b37237b20e
+--- /dev/null
++++ b/backend/app/routers/auth.py
+@@ -0,0 +1,36 @@
++from fastapi import APIRouter, Depends, HTTPException, status
++from fastapi.security import OAuth2PasswordRequestForm
++from sqlalchemy.orm import Session
++
++from .. import auth, models, schemas
++
++router = APIRouter(prefix="/auth", tags=["auth"])
++
++
++@router.post("/token", response_model=schemas.Token)
++async def login_for_access_token(
++    form_data: OAuth2PasswordRequestForm = Depends(),
++    db: Session = Depends(auth.get_db),
++):
++    user = auth.authenticate_user(db, form_data.username, form_data.password)
++    if not user:
++        raise HTTPException(
++            status_code=status.HTTP_401_UNAUTHORIZED,
++            detail="Incorrect email or password",
++        )
++    access_token = auth.create_access_token(data={"sub": user.email})
++    return {"access_token": access_token, "token_type": "bearer"}
++
++
++@router.get("/me", response_model=schemas.UserProfile)
++async def read_users_me(current_user: models.User = Depends(auth.get_current_user)):
++    roles = [assignment.role for assignment in current_user.roles]
++    return schemas.UserProfile(
++        id=current_user.id,
++        employee_id=current_user.employee_id,
++        full_name=current_user.full_name,
++        email=current_user.email,
++        is_active=current_user.is_active,
++        department=current_user.department,
++        roles=roles,
++    )
+diff --git a/backend/app/routers/users.py b/backend/app/routers/users.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b05915c4beeb3a77d38586a562ea9d7529391f34
+--- /dev/null
++++ b/backend/app/routers/users.py
+@@ -0,0 +1,54 @@
++from fastapi import APIRouter, Depends, HTTPException, status
++from sqlalchemy.orm import Session
++
++from .. import audit, auth, models, schemas
++
++router = APIRouter(prefix="/users", tags=["users"])
++
++
++@router.post("", response_model=schemas.UserBase)
++async def create_user(
++    payload: schemas.UserCreate,
++    db: Session = Depends(auth.get_db),
++    current_user: models.User = Depends(auth.require_role("Admin")),
++):
++    existing = (
++        db.query(models.User)
++        .filter(models.User.email == payload.email)
++        .first()
++    )
++    if existing:
++        raise HTTPException(
++            status_code=status.HTTP_409_CONFLICT,
++            detail="Email already registered",
++        )
++    department = db.query(models.Department).filter_by(id=payload.department_id).first()
++    if not department:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail="Department not found",
++        )
++    user = models.User(
++        employee_id=payload.employee_id,
++        full_name=payload.full_name,
++        email=payload.email,
++        hashed_password=auth.get_password_hash(payload.password),
++        department_id=payload.department_id,
++    )
++    db.add(user)
++    db.commit()
++    db.refresh(user)
++    audit.log_audit(
++        db,
++        action="create",
++        entity="user",
++        entity_id=str(user.id),
++        actor_id=current_user.id,
++        details=f"Created user {user.email}",
++    )
++    return user
++
++
++@router.get("/me", response_model=schemas.UserBase)
++async def read_my_profile(current_user: models.User = Depends(auth.get_current_user)):
++    return current_user
+diff --git a/backend/app/schemas.py b/backend/app/schemas.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ea139e3d39565ddcc4434414d85cb47cb05dc7f
+--- /dev/null
++++ b/backend/app/schemas.py
+@@ -0,0 +1,49 @@
++from datetime import datetime
++from pydantic import BaseModel, EmailStr
++
++
++class Token(BaseModel):
++    access_token: str
++    token_type: str
++
++
++class RoleBase(BaseModel):
++    id: int
++    name: str
++    description: str | None = None
++
++    class Config:
++        from_attributes = True
++
++
++class DepartmentBase(BaseModel):
++    id: int
++    name: str
++    location: str | None = None
++
++    class Config:
++        from_attributes = True
++
++
++class UserBase(BaseModel):
++    id: int
++    employee_id: str
++    full_name: str
++    email: EmailStr
++    is_active: bool
++    department: DepartmentBase
++
++    class Config:
++        from_attributes = True
++
++
++class UserCreate(BaseModel):
++    employee_id: str
++    full_name: str
++    email: EmailStr
++    password: str
++    department_id: int
++
++
++class UserProfile(UserBase):
++    roles: list[RoleBase]
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..f5fa506bf40981b3273a9727f9473bd7a880d89f
+--- /dev/null
++++ b/backend/requirements.txt
+@@ -0,0 +1,6 @@
++fastapi==0.111.0
++uvicorn==0.30.1
++sqlalchemy==2.0.30
++pydantic==2.7.4
++python-jose==3.3.0
++passlib[bcrypt]==1.7.4
+diff --git a/backend/seed.py b/backend/seed.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b37b700a22bbdeff8f217615387843268cafbfd
+--- /dev/null
++++ b/backend/seed.py
+@@ -0,0 +1,76 @@
++from sqlalchemy.orm import Session
++
++from app import auth, models
++from app.db import Base, engine, SessionLocal
++
++
++def seed():
++    Base.metadata.create_all(bind=engine)
++    db: Session = SessionLocal()
++    try:
++        if db.query(models.Role).count() == 0:
++            roles = [
++                models.Role(name="Employee", description="Learner role"),
++                models.Role(name="Trainer", description="Creates and assigns training"),
++                models.Role(name="Quality Manager", description="ISO 9001 compliance"),
++                models.Role(name="Safety Manager", description="MIOSHA compliance"),
++                models.Role(name="Admin", description="System administration"),
++            ]
++            db.add_all(roles)
++        if db.query(models.Department).count() == 0:
++            departments = [
++                models.Department(name="Press Operations", location="Plant A"),
++                models.Department(name="Die Handling", location="Plant A"),
++                models.Department(name="Maintenance", location="Plant A"),
++                models.Department(name="Quality", location="Plant A"),
++                models.Department(name="Safety", location="Plant A"),
++            ]
++            db.add_all(departments)
++        db.commit()
++
++        admin = db.query(models.User).filter_by(email="admin@alumex.local").first()
++        if not admin:
++            press_ops = db.query(models.Department).filter_by(name="Press Operations").first()
++            admin = models.User(
++                employee_id="A-100",
++                full_name="Alex Morgan",
++                email="admin@alumex.local",
++                hashed_password=auth.get_password_hash("ChangeMe123!"),
++                department_id=press_ops.id,
++            )
++            db.add(admin)
++            db.commit()
++            db.refresh(admin)
++            admin_role = db.query(models.Role).filter_by(name="Admin").first()
++            db.add(models.UserRole(user_id=admin.id, role_id=admin_role.id))
++        if db.query(models.Course).count() == 0:
++            courses = [
++                models.Course(
++                    title="Lockout/Tagout for Aluminum Presses",
++                    category="Safety",
++                    description="MIOSHA-required safe energy control procedures.",
++                ),
++                models.Course(
++                    title="Die Changeover Quality Checks",
++                    category="Quality",
++                    description="ISO 9001 focused inspection steps during die swaps.",
++                ),
++                models.Course(
++                    title="Press Startup SOP",
++                    category="Operations",
++                    description="Step-by-step startup checklist for extrusion presses.",
++                ),
++                models.Course(
++                    title="Preventive Maintenance - Hydraulic Systems",
++                    category="Maintenance",
++                    description="Daily and weekly PM tasks for hydraulic systems.",
++                ),
++            ]
++            db.add_all(courses)
++        db.commit()
++    finally:
++        db.close()
++
++
++if __name__ == "__main__":
++    seed()
+diff --git a/docs/assumptions.md b/docs/assumptions.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e4a589be1a59835ab317ba1d770a1cd1e3b4543
+--- /dev/null
++++ b/docs/assumptions.md
+@@ -0,0 +1,19 @@
++# Phase 1 Assumptions
++
++- The LMS will be deployed internally on a secure network with self-hosted infrastructure.
++- Shared shop-floor devices will use short session timeouts and require re-authentication.
++- Authentication is handled through username/password with JWT tokens; SSO is deferred to Phase 2.
++- Document storage (videos, PDFs, SOPs) is assumed to be an internal file store; URLs are stored for now.
++- Training assignments will expand to include equipment- and incident-based workflows in Phase 2.
++
++# Phase 2 Tasks
++
++1. Build shop-floor-first UI (large buttons, quick progress, kiosk mode).
++2. Add course assignment workflows (by role, department, equipment, incident).
++3. Implement quizzes, pass/fail thresholds, and scoring rules.
++4. Add certification renewal reminders and automatic retraining workflows.
++5. Add document revision workflows with re-acknowledgment prompts.
++6. Build reporting dashboards (ISO 9001 and MIOSHA audit exports).
++7. Add role-based admin screens for trainers, safety, and quality managers.
++8. Add CSV/PDF export capabilities and audit-ready report templates.
++9. Implement SSO and MFA integration for internal identity providers.
+diff --git a/docs/compliance.md b/docs/compliance.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb6e76cd6ae78f642e0267023579ee9d12927cf6
+--- /dev/null
++++ b/docs/compliance.md
+@@ -0,0 +1,14 @@
++# ISO 9001:2015 and MIOSHA Alignment (Phase 1)
++
++## ISO 9001:2015
++- **Competence and awareness**: Users, roles, and departments are modeled to track competence per role and department. Training records link to users and courses. (Models: `User`, `Role`, `Department`, `Enrollment`, `Certification`.)
++- **Documented information**: Training modules include version fields and acknowledgment tracking for revision control. (Models: `CourseModule`, `Acknowledgment`.)
++- **Auditability**: All critical actions are captured in `AuditLog`, establishing an immutable audit trail foundation.
++- **Continuous improvement**: Incident logging and retraining flags are modeled for future workflow automation.
++
++## MIOSHA
++- **Training and retraining**: Courses and enrollments capture assigned reasons and status to support retraining triggers.
++- **Pass/fail thresholds and certification**: Certification records include expiration tracking, enabling renewal alerts.
++- **Recordkeeping**: Audit logs and acknowledgments provide time-stamped records for inspections.
++
++Phase 2 will expand on automated retraining triggers, quiz scoring, and MIOSHA-specific export templates.
+diff --git a/docs/schema.md b/docs/schema.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..7349302c018d9c5edd232c5cbccc294f387b8b7b
+--- /dev/null
++++ b/docs/schema.md
+@@ -0,0 +1,23 @@
++# Database Schema (Phase 1)
++
++## Core Tables
++
++- **departments**: `id`, `name`, `location`
++- **roles**: `id`, `name`, `description`
++- **users**: `id`, `employee_id`, `full_name`, `email`, `hashed_password`, `is_active`, `department_id`, `created_at`
++- **user_roles**: `id`, `user_id`, `role_id`, `assigned_at`
++- **courses**: `id`, `title`, `category`, `description`, `is_active`, `created_at`
++- **course_modules**: `id`, `course_id`, `title`, `content_type`, `content_url`, `version`, `requires_ack`, `updated_at`
++- **enrollments**: `id`, `user_id`, `course_id`, `assigned_reason`, `assigned_at`, `due_date`, `completed_at`, `status`
++- **certifications**: `id`, `user_id`, `course_id`, `awarded_at`, `expires_at`, `status`
++- **incidents**: `id`, `reported_by`, `incident_type`, `description`, `occurred_at`, `retraining_required`
++- **acknowledgments**: `id`, `user_id`, `module_id`, `revision`, `acknowledged_at`
++- **audit_logs**: `id`, `actor_id`, `action`, `entity`, `entity_id`, `details`, `created_at`
++
++## Key Relationships
++
++- Users belong to departments and can hold multiple roles (user_roles).
++- Courses contain multiple modules; modules can require acknowledgments tied to document revisions.
++- Enrollments track assigned and completed training.
++- Certifications capture expiration dates for compliance.
++- Audit logs record all critical changes for ISO 9001 and MIOSHA auditability.
+diff --git a/frontend/README.md b/frontend/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..fdabff9bd54756c7d896f0dee329ab49f3a97cfb
+--- /dev/null
++++ b/frontend/README.md
+@@ -0,0 +1,3 @@
++# Frontend (Phase 1 Placeholder)
++
++Phase 1 focuses on backend foundations and compliance modeling. The frontend will be delivered in Phase 2 with a shop-floor-friendly UI.
+ 
+EOF
+)
